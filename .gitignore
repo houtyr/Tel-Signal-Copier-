@@ -1,0 +1,23 @@
+# Windows user-profile files – not source code
+NTUSER.DAT*
+ntuser.*
+AppData/
+Contacts/
+Cookies/
+Favorites/
+IntelGraphicsProfiles/
+Links/
+Local Settings/
+Music/
+My Documents/
+NetHood/
+OneDrive/
+PrintHood/
+Recent/
+Saved Games/
+Searches/
+SendTo/
+Start Menu/
+Templates/
+Videos/
+my-new-project/

@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime files created on first run (contain credentials / local state)
+settings.json
+state.json
+copier.db
+copier.log
+paper_state/
+
+# Telethon session file (contains your Telegram auth token)
+*.session
+*.session-journal
