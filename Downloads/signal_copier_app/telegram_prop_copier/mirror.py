@@ -36,6 +36,8 @@ class MirrorMixin:
                 try:
                     await self._mirror_source(src, fols)
                 except Exception as e:
+                    if src in self.accounts and self.rate_limit_pause(self.accounts[src], e):
+                        continue
                     self.note("error", src, f"mirror: {e}")
 
     def mirror_groups(self) -> list[dict]:
@@ -47,13 +49,16 @@ class MirrorMixin:
                                        "value": c.get("mirror_value"), "enabled": c.get("mirror_enabled", True),
                                        "sl_tp": c.get("mirror_sl_tp", True)})
         for src, g in out.items():
-            g["tracked"] = len(self.state["mirror"].get(src, {}).get("pos", {}))
+            pos = self.state["mirror"].get(src, {}).get("pos", {})
+            g["tracked"] = len(pos)
+            for f in g["followers"]:     # source trades this follower currently holds a copy of
+                f["copies"] = sum(1 for r in pos.values() if r["f"].get(f["name"]))
         return list(out.values())
 
     # ---------- one source ----------
     async def _mirror_source(self, src: str, fols: list[str]):
         acc = self.accounts.get(src)
-        if not acc or acc.status != "connected":
+        if not acc or acc.status != "connected" or time.time() < acc.paused_until:
             return
         now = time.time()
         cur = {str(p.ticket): p for p in await acc.call("all_positions")}

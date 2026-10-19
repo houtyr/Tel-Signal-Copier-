@@ -21,6 +21,18 @@ log = logging.getLogger("tradelocker")
 DEFAULT_CONTRACT_SIZES = {"XAUUSD": 100, "XAGUSD": 5000, "US30": 1, "NAS100": 1, "SPX500": 1,
                           "GER40": 1, "BTCUSD": 1, "ETHUSD": 1, "USOIL": 1000}
 
+# TradeLocker answers 429 "Too Many Requests" when an account is polled too often. Reads are cached for
+# REFRESH_SEC so one poll cycle shares a single request per endpoint; after a 429 we stop reading for
+# QUIET_SEC and serve the last good data instead.
+REFRESH_SEC = 2.0
+QUIET_SEC = 10.0
+WRITE_RETRY_WAITS = (2, 5)
+
+
+def is_rate_limit(err: Exception) -> bool:
+    s = str(err)
+    return "429" in s or "Too Many Requests" in s
+
 
 class TradeLockerBroker(Broker):
     def __init__(self, cfg: dict):
@@ -31,6 +43,53 @@ class TradeLockerBroker(Broker):
         self.strategy_id = str(cfg.get("strategy_id", "tg-copier"))[:31]
         self._ids: dict[str, int] = {}
         self._names: dict[int, str] = {}
+        self._cache: dict[str, tuple[float, object]] = {}
+        self._quiet_until = 0.0
+
+    # ---------- request pacing ----------
+    def _rate_limited(self) -> RuntimeError:
+        self._quiet_until = time.time() + QUIET_SEC
+        log.warning("[%s] TradeLocker rate limit hit - pausing reads for %.0fs", self.name, QUIET_SEC)
+        return RuntimeError(f"TradeLocker rate limit (429 Too Many Requests) - slowing down for {QUIET_SEC:.0f}s")
+
+    def _read(self, key: str, fn, force: bool = False):
+        """Cached read. Serves the last good value while TradeLocker is rate-limiting us."""
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit and (now < self._quiet_until or now - hit[0] < (0.5 if force else REFRESH_SEC)):
+            return hit[1]
+        if now < self._quiet_until:
+            raise RuntimeError("TradeLocker rate limit (429 Too Many Requests) - waiting before the next request")
+        try:
+            val = fn()
+        except Exception as e:
+            if not is_rate_limit(e):
+                raise
+            err = self._rate_limited()
+            if hit:
+                return hit[1]
+            raise err from None
+        self._cache[key] = (time.time(), val)
+        return val
+
+    def _write(self, fn):
+        """Order changes are retried after a 429 (the request was refused, not executed)."""
+        for wait in WRITE_RETRY_WAITS + (None,):
+            try:
+                out = fn()
+                break
+            except Exception as e:
+                if not is_rate_limit(e):
+                    raise
+                if wait is None:
+                    raise self._rate_limited() from None
+                log.warning("[%s] TradeLocker rate limit on an order request - retrying in %ss", self.name, wait)
+                time.sleep(wait)
+        self._cache = {k: (0.0, v) for k, v in self._cache.items()}   # expire reads, keep them as fallback
+        return out
+
+    def _orders(self, history: bool = False, force: bool = False):
+        return self._read("history" if history else "orders", lambda: self.tl.get_all_orders(history=history), force)
 
     def connect(self) -> None:
         if TLAPI is None:
@@ -48,7 +107,7 @@ class TradeLockerBroker(Broker):
             pass
 
     def account(self) -> AccountInfo:
-        s = self.tl.get_account_state()
+        s = self._read("state", self.tl.get_account_state)
         return AccountInfo(float(s["balance"]), float(s.get("projectedBalance", s["balance"])), self.currency)
 
     # ---------- symbols ----------
@@ -115,13 +174,13 @@ class TradeLockerBroker(Broker):
             kw.update(stop_loss=sl, stop_loss_type="absolute")
         if tp:
             kw.update(take_profit=tp, take_profit_type="absolute")
-        order_id = self.tl.create_order(**kw)
+        order_id = self._write(lambda: self.tl.create_order(**kw))
         if not order_id:
             raise RuntimeError(f"[{self.name}] create_order rejected for {symbol} {side} {volume}")
         return int(order_id)
 
-    def _positions_df(self):
-        return self.tl.get_all_positions()
+    def _positions_df(self, force: bool = False):
+        return self._read("positions", self.tl.get_all_positions, force)
 
     def positions(self) -> list[Position]:
         df = self._positions_df()
@@ -144,7 +203,7 @@ class TradeLockerBroker(Broker):
             return []
         prices = {}
         try:
-            orders = self.tl.get_all_orders(history=False)
+            orders = self._orders()
             for _, o in orders.iterrows():
                 px = o.get("stopPrice") if str(o.get("type")) == "stop" else o.get("price")
                 if px == px and px:  # not NaN / 0
@@ -171,13 +230,17 @@ class TradeLockerBroker(Broker):
         """`ref` is an order id. Look up the position it opened (retries briefly; fills are async)."""
         if self.is_pending(ref):
             return None
-        for _ in range(3):
+        for attempt in range(3):
             try:
-                pid = self.tl.get_position_id_from_order_id(ref)
-            except Exception:
+                hist = self._orders(history=True, force=attempt > 0)
+                match = hist[hist["id"] == int(ref)] if hist is not None and not hist.empty else []
+                pid = int(match["positionId"].iloc[0]) if len(match) else None
+            except Exception as e:
+                if is_rate_limit(e):
+                    raise
                 pid = None
             if pid:
-                df = self._positions_df()
+                df = self._positions_df(force=attempt > 0)
                 if df is not None and not df.empty and int(pid) in set(df["id"].astype(int)):
                     return int(pid)
                 return None  # opened but already closed
@@ -190,21 +253,25 @@ class TradeLockerBroker(Broker):
             params.update(stopLoss=sl, stopLossType="absolute")
         if tp is not None:
             params.update(takeProfit=tp, takeProfitType="absolute")
-        return bool(params) and self.tl.modify_position(int(ticket), params)
+        return bool(params) and self._write(lambda: self.tl.modify_position(int(ticket), params))
 
     def close(self, ticket, volume=None) -> bool:
-        return self.tl.close_position(position_id=int(ticket), close_quantity=float(volume or 0))
+        return self._write(lambda: self.tl.close_position(position_id=int(ticket), close_quantity=float(volume or 0)))
 
     def cancel_pending(self, ref) -> bool:
         try:
-            return self.tl.delete_order(int(ref))
+            return self._write(lambda: self.tl.delete_order(int(ref)))
         except Exception as e:
+            if is_rate_limit(e):
+                raise
             log.info("cancel %s: %s", ref, e)
             return False
 
     def is_pending(self, ref) -> bool:
         try:
-            df = self.tl.get_all_orders(history=False)
-        except Exception:
+            df = self._orders()
+        except Exception as e:
+            if is_rate_limit(e):
+                raise
             return False
         return df is not None and not df.empty and int(ref) in set(df["id"].astype(int))

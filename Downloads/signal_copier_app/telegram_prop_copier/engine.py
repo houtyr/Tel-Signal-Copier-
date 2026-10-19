@@ -90,6 +90,8 @@ class Account:
         self.halted = ""
         self.retry_at = 0.0
         self.last_equity_write = 0.0
+        self.paused_until = 0.0          # broker asked us to slow down (HTTP 429) - skip polls until then
+        self.last_rate_note = 0.0
 
     @property
     def cfg(self) -> dict:
@@ -295,9 +297,23 @@ class Engine(MirrorMixin):
             await asyncio.sleep(float(self.settings.get("poll_sec", 3)))
             await asyncio.gather(*(self._poll(a) for a in list(self.accounts.values())), return_exceptions=True)
 
+    def rate_limit_pause(self, acc: Account, err: Exception) -> bool:
+        """A 429 from the broker isn't a lost connection - reconnecting would log in again and send even
+        more requests. Pause this account's polling for a while instead. Returns False for other errors."""
+        s = str(err)
+        if "429" not in s and "Too Many Requests" not in s and "rate limit" not in s.lower():
+            return False
+        acc.paused_until = time.time() + 15
+        if time.time() - acc.last_rate_note > 60:
+            acc.last_rate_note = time.time()
+            self.note("warn", acc.name, "broker is rate-limiting requests (429) - polling paused for 15s, still connected")
+        return True
+
     async def _poll(self, acc: Account):
         c = self.settings.account(acc.name)
         if not c or not c.get("enabled", True):
+            return
+        if time.time() < acc.paused_until:
             return
         if acc.status == "error" and time.time() > acc.retry_at:
             await self.connect(acc.name)
@@ -315,8 +331,9 @@ class Engine(MirrorMixin):
             await self._enforce_limits(acc, start)
             await self._breakeven_runners(acc)
         except Exception as e:
-            acc.status, acc.error, acc.retry_at = "error", str(e)[:300], time.time() + 15
-            self.note("error", acc.name, f"lost connection: {acc.error}")
+            if not self.rate_limit_pause(acc, e):
+                acc.status, acc.error, acc.retry_at = "error", str(e)[:300], time.time() + 15
+                self.note("error", acc.name, f"lost connection: {acc.error}")
         self.emit_account(acc)
 
     async def _enforce_limits(self, acc: Account, start: float):
@@ -673,13 +690,29 @@ class Engine(MirrorMixin):
             plan = plan[:-1]              # too small to split across every layer - drop the deepest
         per_layer = total / len(plan)
 
-        tps_all = [t for t in sig.tps if (t > (sl or 0)) == (sig.side == "buy")]
-        tps = tps_all[: int(r.get("max_tps", 3))] if r.get("split_tps", True) else tps_all[-1:]
-        if r.get("use_final_tp_only") and tps_all:
-            tps = [tps_all[-1]]
+        buy = sig.side == "buy"
+        tps_all = [t for t in sig.tps if (t > (sl or 0)) == buy]
 
-        refs, layers_out, placed = [], [], []
+        def layer_tps(entry_px: float) -> list[float]:
+            # A TP the price has already passed would be rejected or close instantly - drop it,
+            # its share of the volume goes to the remaining TPs
+            ok = [t for t in tps_all if (t > entry_px) == buy]
+            if r.get("use_final_tp_only") and ok:
+                return [ok[-1]]
+            return ok[: int(r.get("max_tps", 3))] if r.get("split_tps", True) else ok[-1:]
+
+        refs, layers_out, placed, leg_counts = [], [], [], []
         for layer, otype, price in plan:
+            entry_px = mkt if otype == "market" else price
+            tps = layer_tps(entry_px)
+            if tps_all and not tps:
+                self.note("warn", a.name, f"layer {layer + 1}: every TP is already past the entry {entry_px:.5g} - not placed")
+                continue
+            if len(tps) < min(len(tps_all), int(r.get("max_tps", 3))) and r.get("split_tps", True) \
+                    and not r.get("use_final_tp_only"):
+                gone = [f"{t:g}" for t in tps_all if (t > entry_px) != buy]
+                self.note("info", a.name, f"layer {layer + 1}: TP {', '.join(gone)} already past the entry {entry_px:.5g} - skipped")
+            leg_counts.append(len(tps) or 1)
             vols = split_volume(floor_step(per_layer, spec.volume_step), max(1, len(tps)), spec)
             legs_tp = tps[: len(vols)] + [None] * (len(vols) - len(tps[: len(vols)]))
             for v, tp in zip(vols, legs_tp):
@@ -693,8 +726,11 @@ class Engine(MirrorMixin):
                 self.store.add_trade(a.name, key, "open" if not label else label, sym, sig.side, v, ref,
                                      f"layer {layer + 1} {otype}{f' @ {price:g}' if price else ''} SL {sl} TP {tp}")
             placed.append(f"{'market' if otype == 'market' else f'limit {price:g}'}")
+        if not placed:
+            self.note("warn", a.name, "skipped - every TP is already past the entry price"); return [], []
+        n_legs = max(leg_counts)
         desc = (f"{sig.side.upper()} {sym} {total:.2f} lots - {' + '.join(placed)}"
-                f" ({len(tps) or 1} TP leg{'s' if len(tps) > 1 else ''} each) SL {sl:.5g}")
+                f" ({n_legs} TP leg{'s' if n_legs > 1 else ''} each) SL {sl:.5g}")
         self.note("ok", a.name, ("DRY RUN - would have placed " if dry else (f"{label}: " if label else "placed ")) + desc)
         if (refs or dry) and not label:
             self.state["daily"][a.name]["signals"] += 1

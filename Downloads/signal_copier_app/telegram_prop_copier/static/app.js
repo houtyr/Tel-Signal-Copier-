@@ -151,6 +151,7 @@ function renderLive() {
     if (S.tab === 'overview') { renderKpis(); renderAccCards(); renderPositions(); renderFeed('#feed'); renderChartThrottled(); }
     if (S.tab === 'telegram') { renderFeed('#feed2'); }
     if (S.tab === 'accounts') { renderAccountTableBody(); }
+    if (S.tab === 'copy') renderCopyBody();
     if (S.tab === 'activity') renderActivityTables();
   });
 }
@@ -158,7 +159,7 @@ function renderLive() {
 function render() {
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === S.tab));
   const main = $('#main');
-  ({ overview: renderOverview, accounts: renderAccounts, telegram: renderTelegram, activity: renderActivity, settings: renderSettings }[S.tab] || renderOverview)(main);
+  ({ overview: renderOverview, accounts: renderAccounts, copy: renderCopy, telegram: renderTelegram, activity: renderActivity, settings: renderSettings }[S.tab] || renderOverview)(main);
   renderTop(); renderBanner();
 }
 
@@ -356,9 +357,10 @@ function parsedSummary(m) {
   if (m.kind === 'signal') return `${p.side.toUpperCase()} ${p.symbol}${p.order_type !== 'market' ? ' ' + p.order_type.toUpperCase() : ''} @ ${p.layers?.length ? p.layers.join(' / ') : (p.entry ?? 'market')} · SL ${p.sl ?? '—'} · TP ${p.tps.length ? p.tps.join(' / ') : '—'}`;
   return `${p.action.replace('_', ' ').toUpperCase()}${p.symbol ? ' ' + p.symbol : ''}${p.value != null ? ' ' + p.value : ''}${m.reply_to ? ' (reply)' : ''}`;
 }
-function renderFeed(sel) {
+function renderFeed(sel, filter = null, emptyText = '') {
   const el = $(sel); if (!el) return;
-  const list = S.messages.slice(0, 120);
+  const list = (filter ? S.messages.filter(filter) : S.messages).slice(0, 120);
+  if (!list.length && emptyText) { el.innerHTML = `<div class="empty">${emptyText}</div>`; return; }
   if (!list.length) {
     el.innerHTML = `<div class="empty">No messages yet.<br><span style="font-size:12px">${S.telegram.status === 'connected'
       ? 'Waiting for your monitored channels to post.' : 'Connect Telegram, or send a test signal from the Telegram tab.'}</span></div>`;
@@ -467,29 +469,182 @@ function renderAccounts(main) {
       <div class="table-wrap"><table><thead><tr><th>Account</th><th>Platform</th><th>Status</th><th class="r">Equity</th><th class="r">Today</th>
         <th class="r">Risk</th><th>Copies from</th><th>Telegram</th><th></th></tr></thead><tbody id="accBody"></tbody></table></div>
     </section>
-    <section class="card" id="linksCard"></section>
     <div id="editor"></div>
   </div>`;
-  renderLinks();
   renderAccountTableBody();
   renderEditor();
 }
 
-function renderLinks() {
-  const el = $('#linksCard'); if (!el) return;
-  const groups = {};
-  for (const c of S.settings.accounts) if (c.mirror_from) (groups[c.mirror_from] ||= []).push(c);
-  const keys = Object.keys(groups);
-  el.innerHTML = `<div class="card-h"><h2>Account-to-account copying</h2><span class="muted" style="font-size:12px">Set it up with “Mirror another account” when editing a follower</span></div>
-    <div class="card-b">${keys.length ? keys.map(src => {
-      const s = S.accounts[src] || {};
-      return `<div class="link-row"><div class="link-src"><span class="swatch" style="background:${colorVar(src)}"></span><b>${esc(src)}</b>
-          <span class="badge">${PLATFORM[s.platform] || ''}</span><span class="dot ${statusInfo(s)[0]}" title="${statusInfo(s)[1]}"></span></div>
-        <div class="link-arrow" aria-hidden="true">→</div>
-        <div class="link-fols">${groups[src].map(f => `<div class="row" style="gap:8px"><span class="swatch" style="background:${colorVar(f.name)}"></span><b>${esc(f.name)}</b>
-          <span class="badge">${PLATFORM[f.platform]}</span><span class="muted" style="font-size:12px">${esc(SIZING[f.mirror_sizing || 'equity_ratio'][0])}${f.mirror_value ? ' · ' + f.mirror_value : ''}${f.mirror_sl_tp === false ? ' · no SL/TP' : ''}</span>
-          ${f.mirror_enabled === false ? '<span class="badge">paused</span>' : ''}</div>`).join('')}</div></div>`;
-    }).join('') : '<div class="muted" style="font-size:12.5px">No links yet. Edit an account and pick a source under <b>Mirror another account</b> — e.g. copy your MT5 account into your TradeLocker accounts.</div>'}</div>`;
+// ------------------------------------------------------------------ COPY TRADING (account → account)
+const sizingText = f => {
+  const m = f.mirror_sizing || 'equity_ratio', v = f.mirror_value;
+  return SIZING[m][0] + (v && SIZING[m][1] ? (m === 'risk' ? ` · ${v}%` : m === 'fixed' ? ` · ${v} lots` : ` × ${v}`) : '');
+};
+const followersOf = src => S.settings.accounts.filter(c => c.mirror_from === src);
+const linkInfo = (src, fol) => (S.mirrorGroups || []).find(g => g.source === src)?.followers.find(f => f.name === fol) || {};
+// Accounts that `name` copies from, directly or through a chain. Making one of them its follower would create a loop.
+function upstream(name) {
+  const out = new Set(); let cur = S.settings.accounts.find(a => a.name === name)?.mirror_from;
+  while (cur && !out.has(cur)) { out.add(cur); cur = S.settings.accounts.find(a => a.name === cur)?.mirror_from; }
+  return out;
+}
+
+async function loadLinks() { S.mirrorGroups = await api('/api/links'); }
+setInterval(() => { if (S.tab === 'copy' && S.wsOk) loadLinks().then(renderCopyBody).catch(() => { }); }, 5000);
+
+function renderCopy(main) {
+  main.innerHTML = `
+  <div class="stack">
+    <div class="row" style="margin:4px 0 0"><h2>Copy trading</h2>
+      <span class="muted" style="font-size:12.5px">Repeat every trade from one account on others: new trades, partial closes, SL/TP changes and closes.</span>
+      <span class="grow"></span><button class="btn sm" data-act="add-account">+ Add account</button>
+      <button class="btn primary sm" data-act="link-new">+ New copy link</button></div>
+    <div class="kpis" id="copyKpis"></div>
+    <div id="editor"></div>
+    <div class="overview">
+      <div class="stack" id="copyGroups"></div>
+      <aside class="card"><div class="card-h"><h2>Copy activity</h2><span class="muted" style="font-size:12px">Trades repeated from source accounts</span></div>
+        <div class="feed" id="copyFeed"></div></aside>
+    </div>
+  </div>`;
+  renderCopyBody(); renderEditor();
+}
+
+function renderCopyBody() {
+  if (!$('#copyGroups')) return;
+  const links = S.settings.accounts.filter(c => c.mirror_from);
+  const sources = [...new Set(links.map(c => c.mirror_from))];
+  const copies = (S.mirrorGroups || []).reduce((t, g) => t + g.followers.reduce((u, f) => u + (f.copies || 0), 0), 0);
+  const today = S.messages.filter(m => m.kind === 'mirror' && Date.now() / 1000 - m.ts < 86400);
+  const opened = today.filter(m => m.parsed?.event === 'open').length;
+  const errors = today.filter(m => m.status === 'error').length;
+  const offline = links.filter(c => S.accounts[c.name]?.status !== 'connected' || S.accounts[c.mirror_from]?.status !== 'connected').length;
+  const paused = links.filter(c => c.mirror_enabled === false).length;
+  $('#copyKpis').innerHTML = [
+    ['Active copy links', links.length - paused, `${sources.length} source${sources.length === 1 ? '' : 's'}${paused ? ` · ${paused} paused` : ''}`],
+    ['Copied trades open', copies, 'source trades held by followers'],
+    ['Trades copied (24h)', opened, `${today.length} copy event${today.length === 1 ? '' : 's'} in total`],
+    ['Needs attention', offline + errors ? `<span class="down">${offline + errors}</span>` : '0',
+      offline ? `${offline} link${offline === 1 ? '' : 's'} with an account offline` : errors ? `${errors} failed copy event${errors === 1 ? '' : 's'}` : 'all links healthy'],
+  ].map(([l, v, s]) => `<div class="card kpi"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${s}</div></div>`).join('');
+
+  const el = $('#copyGroups');
+  if (!sources.length) {
+    const n = S.settings.accounts.length;
+    el.innerHTML = `<section class="card copy-empty"><h2>No copy links yet</h2>
+      <p class="muted">Pick a <b>source</b> account and one or more <b>followers</b>. Every trade on the source is repeated on the followers, sized to each account. Works across MT5, TradeLocker and Paper in any direction.</p>
+      ${n < 2 ? `<p>You need at least two accounts. You have ${n}.</p><div><button class="btn primary sm" data-act="add-account">+ Add account</button></div>`
+        : '<div><button class="btn primary sm" data-act="link-new">+ New copy link</button></div>'}</section>`;
+  } else {
+    el.innerHTML = sources.map(src => {
+      const s = S.accounts[src] || {}; const [dot, label] = statusInfo({ ...s, enabled: true });
+      const cur = s.currency || 'USD';
+      return `<section class="card">
+        <div class="card-h link-head"><span class="swatch" style="background:${colorVar(src)}"></span><h2>${esc(src)}</h2>
+          <span class="badge">${PLATFORM[s.platform] || ''}</span><span class="badge src">SOURCE</span>
+          <span class="row" style="gap:6px;font-size:12.5px"><span class="dot ${dot}"></span>${label}</span><span class="grow"></span>
+          <span class="muted num" style="font-size:12.5px">${fmtMoney(s.equity, cur)} · ${pnl(s.daily_pnl, cur)} today · ${s.positions?.length ?? 0} open</span>
+          <button class="btn sm" data-act="link-new" data-src="${esc(src)}">+ Add follower</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Follower</th><th>Status</th><th>Sizing</th><th>SL/TP</th><th class="r">Equity</th><th class="r">Today</th>
+          <th class="r" title="Source trades this account holds a copy of">Copies</th><th>Copying</th><th></th></tr></thead><tbody>
+          ${followersOf(src).map(f => {
+            const a = S.accounts[f.name] || {}; const [d2, l2] = statusInfo({ ...a, enabled: f.enabled !== false });
+            return `<tr><td><span class="row" style="gap:6px;flex-wrap:nowrap"><span class="muted" aria-hidden="true">↳</span><span class="swatch" style="background:${colorVar(f.name)}"></span><b>${esc(f.name)}</b>
+                <span class="badge">${PLATFORM[f.platform]}</span></span></td>
+              <td><span class="row" style="gap:6px;flex-wrap:nowrap"><span class="dot ${d2}"></span>${l2}</span></td>
+              <td>${esc(sizingText(f))}</td><td>${f.mirror_sl_tp === false ? '<span class="muted">not copied</span>' : 'copied'}</td>
+              <td class="r">${fmtMoney(a.equity, a.currency)}</td><td class="r">${pnl(a.daily_pnl, a.currency)}</td>
+              <td class="r">${linkInfo(src, f.name).copies ?? 0}</td>
+              <td><label class="switch" title="Pause or resume copying from ${esc(src)}"><input type="checkbox" data-act="acc-mirror" data-name="${esc(f.name)}" ${f.mirror_enabled !== false ? 'checked' : ''}><span class="track"></span>${f.mirror_enabled === false ? 'Paused' : 'On'}</label></td>
+              <td class="r" style="white-space:nowrap"><button class="btn sm" data-act="link-edit" data-name="${esc(f.name)}">Edit</button>
+                <button class="btn sm danger" data-act="link-remove" data-name="${esc(f.name)}">Unlink</button></td></tr>`;
+          }).join('')}</tbody></table></div></section>`;
+    }).join('');
+  }
+  renderFeed('#copyFeed', m => m.kind === 'mirror', 'No copied trades yet. When a source account opens, changes or closes a trade, it shows up here.');
+}
+
+function linkModal({ source = '', follower = null, preselect = null } = {}) {
+  const edit = !!follower;
+  const fc = edit ? S.settings.accounts.find(a => a.name === follower) : {};
+  const names = accountOrder();
+  if (names.length < 2) { toast('Add at least two accounts first', true); return; }
+  let src = source || (edit && fc.mirror_from) || names.find(n => n !== preselect && !S.settings.accounts.find(a => a.name === n).mirror_from)
+    || names.find(n => n !== preselect);
+  const checked = new Set(edit ? [follower] : preselect ? [preselect] : []);
+  const sizing = fc.mirror_sizing || 'equity_ratio';
+  const m = $('#modal');
+  m.innerHTML = `<form class="modal wide" role="dialog" aria-modal="true" id="linkForm">
+    <h2>${edit ? `Copy settings for ${esc(follower)}` : 'New copy link'}</h2>
+    <div class="link-pick">
+      <label class="f">Copy trades from<select name="source">${names.filter(n => n !== follower).map(n => `<option ${n === src ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+        <span class="hint">The source. Trade it however you like: manually, an EA, or Telegram signals.</span></label>
+      <div class="link-arrow" aria-hidden="true">→</div>
+      <div class="f"><span>To</span>${edit ? `<div class="check-item" style="cursor:default"><span class="swatch" style="background:${colorVar(follower)}"></span><b class="t">${esc(follower)}</b></div>`
+        : '<div class="check-list" id="folList"></div>'}</div>
+    </div>
+    <fieldset><legend>Lot size on the followers</legend><div class="form-grid">
+      <label class="f">Sizing<select name="mirror_sizing">${Object.entries(SIZING).map(([k, v]) => `<option value="${k}" ${sizing === k ? 'selected' : ''}>${v[0]}</option>`).join('')}</select></label>
+      <label class="f" id="lmValWrap"><span id="lmValLabel"></span><input name="mirror_value" type="number" step="any" min="0" value="${fc.mirror_value ?? ''}" placeholder="1"></label>
+    </div><p class="hint" id="lmHint"></p><p class="link-example" id="lmExample"></p></fieldset>
+    <div class="form-grid">
+      <label class="switch"><input type="checkbox" name="mirror_sl_tp" ${fc.mirror_sl_tp !== false ? 'checked' : ''}><span class="track"></span>Copy SL/TP and their changes</label>
+      <label class="switch"><input type="checkbox" name="mirror_existing" ${fc.mirror_existing ? 'checked' : ''}><span class="track"></span>Also copy trades already open</label>
+    </div>
+    <div class="row"><button type="button" class="btn" data-m="0">Cancel</button><button type="submit" class="btn primary">${edit ? 'Save' : 'Start copying'}</button></div>
+  </form>`;
+  m.hidden = false;
+  const form = $('#linkForm', m);
+  const close = () => { m.hidden = true; m.innerHTML = ''; };
+  m.onclick = e => { if (e.target === m || e.target.closest('[data-m="0"]')) close(); };
+
+  const drawFollowers = () => {
+    const box = $('#folList', m); if (!box) return;
+    const up = upstream(src);
+    box.innerHTML = names.filter(n => n !== src).map(n => {
+      const c = S.settings.accounts.find(a => a.name === n);
+      const loop = up.has(n);
+      const note = loop ? `${esc(src)} copies it - would loop` : c.mirror_from === src ? 'already linked' : c.mirror_from ? `copies ${esc(c.mirror_from)} now - will switch` : '';
+      return `<label class="check-item${loop ? ' disabled' : ''}"><input type="checkbox" name="fol" value="${esc(n)}" ${checked.has(n) && !loop ? 'checked' : ''} ${loop ? 'disabled' : ''}>
+        <span class="swatch" style="background:${colorVar(n)}"></span><span class="t">${esc(n)}</span><span class="badge">${PLATFORM[c.platform]}</span>
+        ${note ? `<span class="muted" style="font-size:11.5px">${note}</span>` : ''}</label>`;
+    }).join('');
+  };
+  const drawSizing = () => {
+    const mode = form.mirror_sizing.value, meta = SIZING[mode];
+    $('#lmValWrap', m).hidden = !meta[1]; $('#lmValLabel', m).textContent = meta[1];
+    $('#lmHint', m).textContent = meta[2];
+    const v = Number(form.mirror_value.value) || (mode === 'risk' ? 0.5 : 1);
+    const fols = [...checked].filter(f => f !== src);
+    const se = S.accounts[src]?.equity;
+    $('#lmExample', m).innerHTML = !fols.length ? '' : `Example: 1.00 lot on <b>${esc(src)}</b> → ` + fols.slice(0, 3).map(f => {
+      const fe = S.accounts[f]?.equity;
+      const lots = mode === 'fixed' || mode === 'multiplier' ? v : mode === 'same' ? 1 : mode === 'equity_ratio' && se && fe ? fe / se * v : null;
+      return `<b>${esc(f)}</b> ${lots != null ? `≈ ${lots.toFixed(2)} lots` : mode === 'risk' ? `risks ${v}% of its size at the source SL` : 'size shows once both are connected'}`;
+    }).join(', ') + (fols.length > 3 ? ', …' : '') + (mode === 'same' || mode === 'multiplier' ? ' <span class="muted">(adjusted when contract sizes differ)</span>' : '');
+  };
+  form.source.onchange = () => { src = form.source.value; checked.delete(src); drawFollowers(); drawSizing(); };
+  form.mirror_sizing.onchange = drawSizing;
+  form.mirror_value.oninput = drawSizing;
+  form.addEventListener('change', e => {
+    if (e.target.name === 'fol') { e.target.checked ? checked.add(e.target.value) : checked.delete(e.target.value); drawSizing(); }
+  });
+  drawFollowers(); drawSizing();
+
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const fols = [...checked].filter(f => f !== src);
+    if (!fols.length) return toast('Tick at least one account to copy to', true);
+    const body = { source: src, mirror_sizing: form.mirror_sizing.value, mirror_value: form.mirror_value.value === '' ? null : Number(form.mirror_value.value),
+      mirror_sl_tp: form.mirror_sl_tp.checked, mirror_existing: form.mirror_existing.checked };
+    const btn = $('[type=submit]', form); btn.disabled = true;
+    try {
+      for (const f of fols) await api('/api/links', { body: { ...body, follower: f, ...(edit ? {} : { mirror_enabled: true }) } });
+      close(); toast(edit ? 'Copy settings saved' : `${fols.join(', ')} now ${fols.length > 1 ? 'copy' : 'copies'} ${src}`);
+      await loadState();
+    } catch { btn.disabled = false; }
+  };
+  form.source.focus();
 }
 
 function channelNames(ids) {
@@ -509,7 +664,7 @@ function renderAccountTableBody() {
       <td>${PLATFORM[cfg.platform]}</td><td><span class="row" style="gap:6px;flex-wrap:nowrap"><span class="dot ${dot}"></span>${label}</span></td>
       <td class="r">${fmtMoney(a.equity, a.currency)}</td><td class="r">${pnl(a.daily_pnl, a.currency)}</td>
       <td class="r">${a.fixed_lot ? a.fixed_lot + ' lot' : pctTxt((a.risk_pct || 0) * (a.risk_multiplier || 1))}</td>
-      <td style="white-space:normal;max-width:240px">${cfg.copy_enabled === false ? '<span class="muted">Telegram off</span>' : channelNames(cfg.channels)}${cfg.mirror_from ? `<br><span class="muted">⇠ mirrors</span> ${esc(cfg.mirror_from)}` : ''}</td>
+      <td style="white-space:normal;max-width:240px">${cfg.copy_enabled === false ? '<span class="muted">Telegram off</span>' : channelNames(cfg.channels)}${cfg.mirror_from ? `<br><span class="muted">⇠ copies</span> <a href="#" data-act="tab" data-tab="copy">${esc(cfg.mirror_from)}</a>` : ''}</td>
       <td><label class="switch"><input type="checkbox" data-act="acc-copy" data-name="${esc(n)}" ${cfg.copy_enabled !== false ? 'checked' : ''}><span class="track"></span></label></td>
       <td class="r"><button class="btn sm" data-act="edit-account" data-name="${esc(n)}">Edit</button>
         <button class="btn sm danger" data-act="delete-account" data-name="${esc(n)}">Remove</button></td></tr>`;
@@ -590,19 +745,11 @@ function renderEditor() {
         <label class="f">Breakeven after TP1<select name="breakeven_after_tp1" data-type="tri"><option value="">Global default (${d.breakeven_after_tp1 ? 'yes' : 'no'})</option>
           <option value="true" ${a.breakeven_after_tp1 === true ? 'selected' : ''}>yes</option><option value="false" ${a.breakeven_after_tp1 === false ? 'selected' : ''}>no</option></select></label>
       </div></fieldset>
-      <fieldset><legend>Mirror another account</legend>
-        <p class="muted" style="font-size:12px;margin:0 0 10px">Repeat every trade from another connected account here: new trades, partial closes, SL/TP changes and closes. Works across MT5, TradeLocker and Paper in any direction.</p>
-        <div class="form-grid">
-          <label class="f">Copy trades from<select name="mirror_from" id="mirrorFrom"><option value="">— Don't mirror —</option>
-            ${accountOrder().filter(x => x !== (S.editing.original || a.name)).map(x => `<option ${a.mirror_from === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>
-          <label class="f">Sizing<select name="mirror_sizing" id="mirrorSizing">${Object.entries(SIZING).map(([k, v]) => `<option value="${k}" ${(a.mirror_sizing || 'equity_ratio') === k ? 'selected' : ''}>${v[0]}</option>`).join('')}</select>
-            <span class="hint" id="sizingHint">${SIZING[a.mirror_sizing || 'equity_ratio'][2]}</span></label>
-          <label class="f" id="mirrorValueWrap" ${SIZING[a.mirror_sizing || 'equity_ratio'][1] ? '' : 'hidden'}><span id="mirrorValueLabel">${SIZING[a.mirror_sizing || 'equity_ratio'][1]}</span>
-            <input name="mirror_value" type="number" step="any" data-type="number" value="${a.mirror_value ?? ''}" placeholder="1"></label>
-          <label class="switch" style="align-self:end;padding-bottom:8px"><input type="checkbox" name="mirror_sl_tp" data-type="bool" ${a.mirror_sl_tp !== false ? 'checked' : ''}><span class="track"></span>Copy SL/TP and their changes</label>
-          <label class="switch" style="align-self:end;padding-bottom:8px"><input type="checkbox" name="mirror_existing" data-type="bool" ${a.mirror_existing ? 'checked' : ''}><span class="track"></span>Also copy trades already open</label>
-        </div>
-      </fieldset>
+      ${isNew ? '' : `<fieldset><legend>Copy trades from another account</legend>
+        <div class="row" style="font-size:12.5px">${a.mirror_from ? `Copies <b>${esc(a.mirror_from)}</b> · ${esc(sizingText(a))}${a.mirror_enabled === false ? ' · paused' : ''}`
+          : '<span class="muted">Not copying another account.</span>'}<span class="grow"></span>
+          <button type="button" class="btn sm" data-act="${a.mirror_from ? 'link-edit' : 'link-new'}" data-name="${esc(S.editing.original)}">${a.mirror_from ? 'Change' : 'Set up'}</button></div>
+      </fieldset>`}
       <fieldset><legend>Telegram channels this account copies</legend>
         ${chans.length ? `<div class="check-list">${chans.map(c => `<label class="check-item"><input type="checkbox" name="channels" value="${c.id}" ${(a.channels || []).map(String).includes(String(c.id)) ? 'checked' : ''}>
           <span class="t">${esc(c.title || c.id)}</span>${c.enabled ? '' : '<span class="badge">not monitored</span>'}</label>`).join('')}</div>
@@ -619,10 +766,6 @@ function renderEditor() {
         <button type="submit" class="btn primary">${isNew ? 'Add & connect' : 'Save & reconnect'}</button></div>
     </form></section>`;
   $('#accForm').addEventListener('submit', saveAccount);
-  $('#mirrorSizing').addEventListener('change', e => {
-    const m = SIZING[e.target.value];
-    $('#sizingHint').textContent = m[2]; $('#mirrorValueLabel').textContent = m[1]; $('#mirrorValueWrap').hidden = !m[1];
-  });
   el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -653,8 +796,10 @@ async function saveAccount(e) {
   try {
     await api('/api/accounts', { body: { account: data, original_name: S.editing.original } });
     toast(`Saved ${data.name}`);
+    const addedOnCopyTab = !S.editing.original && S.tab === 'copy';
     S.editing = null;
     await loadState();
+    if (addedOnCopyTab && accountOrder().length > 1) linkModal({ preselect: data.name });
   } catch { btn.disabled = false; btn.textContent = 'Save & reconnect'; }
 }
 
@@ -902,6 +1047,7 @@ document.addEventListener('click', async e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   const act = b.dataset.act, name = b.dataset.name;
   if (b.tagName === 'INPUT') return; // checkboxes handled on change
+  if (b.tagName === 'A') e.preventDefault();
   try {
     switch (act) {
       case 'tab': setTab(b.dataset.tab); break;
@@ -965,8 +1111,16 @@ document.addEventListener('click', async e => {
       case 'connect': await api(`/api/accounts/${encodeURIComponent(name)}/connect`, { body: {} }); break;
       case 'disconnect': await api(`/api/accounts/${encodeURIComponent(name)}/disconnect`, { body: {} }); break;
       case 'resume': await api(`/api/accounts/${encodeURIComponent(name)}/resume`, { body: {} }); break;
-      case 'add-account': S.editing = { original: null, data: newAccount() }; if (S.tab !== 'accounts') setTab('accounts'); else renderEditor(); break;
-      case 'edit-account': S.editing = { original: name, data: structuredClone(S.settings.accounts.find(a => a.name === name)) }; if (S.tab !== 'accounts') setTab('accounts'); else renderEditor(); break;
+      case 'add-account': S.editing = { original: null, data: newAccount() }; if (!$('#editor')) setTab('accounts'); else renderEditor(); break;
+      case 'edit-account': S.editing = { original: name, data: structuredClone(S.settings.accounts.find(a => a.name === name)) }; if (!$('#editor')) setTab('accounts'); else renderEditor(); break;
+      case 'link-new': linkModal({ source: b.dataset.src || '', ...(name ? { preselect: name } : {}) }); break;
+      case 'link-edit': linkModal({ follower: name }); break;
+      case 'link-remove': {
+        const src = S.settings.accounts.find(a => a.name === name)?.mirror_from;
+        if (!await confirmModal({ title: `Stop copying ${src} to ${name}?`, ok: 'Unlink', danger: true,
+          body: `New trades on <b>${esc(src)}</b> won't be copied to <b>${esc(name)}</b> any more. Trades already copied stay open on ${esc(name)}. Manage or close them yourself.` })) return;
+        await api(`/api/links/${encodeURIComponent(name)}`, { method: 'DELETE' }); toast(`${name} unlinked`); await loadState(); break;
+      }
       case 'cancel-edit': S.editing = null; renderEditor(); break;
       case 'platform': S.editing.data = { ...collectForm($('#accForm'), S.editing.data), platform: b.dataset.p }; renderEditor(); break;
       case 'delete-account':
@@ -1016,6 +1170,7 @@ document.addEventListener('change', async e => {
   if (t.dataset.act === 'acc-mirror') {
     await api(`/api/accounts/${encodeURIComponent(t.dataset.name)}/mirror`, { body: { enabled: t.checked } }).catch(() => t.checked = !t.checked);
     const a = S.settings.accounts.find(x => x.name === t.dataset.name); if (a) a.mirror_enabled = t.checked;
+    renderLive();
   }
   if (t.dataset.act === 'chan-toggle') {
     const chans = S.settings.channels.map(c => String(c.id) === t.dataset.id ? { ...c, enabled: t.checked } : c);

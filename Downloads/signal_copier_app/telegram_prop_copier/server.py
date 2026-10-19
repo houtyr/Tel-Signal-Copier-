@@ -166,6 +166,54 @@ async def account_action(name: str, action: str, body: dict = Body(default={})):
     return ok()
 
 
+# ------------------------------------------------------------------ account-to-account copy links
+LINK_FIELDS = ("mirror_sizing", "mirror_value", "mirror_sl_tp", "mirror_existing", "mirror_enabled")
+
+
+def _emit_link_change(*names):
+    for n in names:
+        if n in engine.accounts:
+            engine.emit_account(engine.accounts[n])
+    bus.emit("settings", settings.public())
+
+
+@app.get("/api/links")
+async def links():
+    return engine.mirror_groups()
+
+
+@app.post("/api/links")
+async def save_link(body: dict = Body(...)):
+    """Make `follower` copy trades from `source`. Only the copy settings change - the follower stays connected."""
+    fol, src = body.get("follower") or "", body.get("source") or ""
+    a = settings.account(fol)
+    if not a:
+        raise HTTPException(404, f"no account called {fol}")
+    if not settings.account(src):
+        raise HTTPException(404, f"no account called {src}")
+    old_src = a.get("mirror_from")
+    patch = {k: body[k] for k in LINK_FIELDS if k in body}
+    try:
+        settings.upsert_account({**a, **patch, "mirror_from": src}, fol)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    engine.note("info", fol, f"now copies trades from {src}" if old_src != src else f"copy settings from {src} updated")
+    _emit_link_change(fol, src, *([old_src] if old_src and old_src != src else []))
+    return ok()
+
+
+@app.delete("/api/links/{follower}")
+async def remove_link(follower: str):
+    a = settings.account(follower)
+    if not a or not a.get("mirror_from"):
+        raise HTTPException(404, "that account isn't copying another account")
+    src = a["mirror_from"]
+    settings.upsert_account({**a, "mirror_from": None}, follower)
+    engine.note("info", follower, f"stopped copying trades from {src}")
+    _emit_link_change(follower, src)
+    return ok()
+
+
 @app.post("/api/flatten_all")
 async def flatten_all():
     await engine.flatten_everything()
