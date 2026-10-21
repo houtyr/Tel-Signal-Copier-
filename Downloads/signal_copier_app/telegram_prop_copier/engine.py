@@ -386,7 +386,7 @@ class Engine(MirrorMixin):
             todo = [r for r in refs if legs.get(str(r), {}).get("s") != "closed"]
             states = await acc.call("leg_states", todo) if todo else {}
             for r in todo:
-                L, s = legs.setdefault(str(r), {"s": "pending", "miss": 0}), states.get(r)
+                L, s = legs.setdefault(str(r), {"s": "new", "miss": 0}), states.get(r)
                 if s == "pending":
                     L["s"] = "pending"
                 elif s:
@@ -398,7 +398,10 @@ class Engine(MirrorMixin):
                     L["miss"] = L.get("miss", 0) + 1
                     if L["miss"] >= 2 and now - rec["ts"] > 30:
                         L["s"], changed = "closed", True
-            pending = [r for r in refs if legs[str(r)]["s"] == "pending"]
+                    elif L["s"] == "pending":
+                        L["s"] = "gone?"      # was pending, now isn't - filled or cancelled; never re-cancel it
+            # only orders the broker reported as pending on this check get cancelled
+            pending = [r for r in todo if states.get(r) == "pending"]
             live = [(r, legs[str(r)]) for r in refs if legs[str(r)]["s"] == "open"]
             if not pending and not live:
                 if all(legs[str(r)]["s"] == "closed" for r in refs):
