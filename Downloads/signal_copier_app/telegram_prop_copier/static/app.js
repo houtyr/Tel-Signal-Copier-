@@ -974,13 +974,28 @@ function renderSettings(main) {
         ${sel('require_sl', 'Require a stop loss', yn, r.require_sl, 'Most prop firms require one')}
         ${sel('split_tps', 'One position per TP', yn)}
         ${num('max_tps', 'Max TP legs')}
-        ${sel('breakeven_after_tp1', 'Move runners to BE after TP1', yn)}
-        ${num('breakeven_offset', 'Breakeven offset (price)')}
+        ${sel('breakeven_after_tp1', 'Auto breakeven', yn, r.breakeven_after_tp1, 'See Trade management for when it triggers')}
+        ${num('breakeven_offset', 'Extra breakeven offset (price)', 'Added on top of the R-based lock; usually 0')}
         ${num('max_entry_slip_of_sl', 'Max entry slip (× SL distance)', '0.3 = 30% of the stop distance')}
         ${sel('if_price_moved', 'If price ran past entry', [['limit', 'Place limit at entry'], ['skip', 'Skip the signal'], ['market', 'Enter at market anyway']])}
         ${sel('zone_entry', 'Zone signals (4139//4129)', [['layers', 'Two layers: market + limit at 2nd price'], ['first', 'First price only']], r.zone_entry, 'Risk is spread across the layers')}
         ${sel('tp_hit_action', 'When the channel posts “TP hit”', [['breakeven', 'Move SL to breakeven'], ['trail', 'Breakeven at TP1, then SL to previous TP'], ['none', 'Do nothing']], r.tp_hit_action)}
         ${sel('add_on_entries', '“Add more” re-entries', [['half', 'Take them at half risk'], ['full', 'Take them at full risk'], ['off', 'Ignore (still apply SL updates)']], r.add_on_entries)}
+      </div></section>
+    <section class="card"><div class="card-h"><h2>Trade management</h2><span class="muted" style="font-size:12px">Distances are in R = entry-to-SL distance, so the same values work on every symbol</span></div>
+      <div class="card-b form-grid">
+        ${num('be_trigger_r', 'Breakeven once price is (R) in profit', '0.3 = 30% of the stop distance. 0 = as soon as it’s in profit')}
+        ${num('be_lock_r', 'Breakeven stop sits (R) into profit', 'Covers spread + commission. 0.05 ≈ 1 point on gold with a 20-point SL')}
+        ${sel('trail_tp_ladder', 'Lock profit TP by TP', yn, r.trail_tp_ladder, 'When price reaches TP3, the stop moves to TP2 (and so on)')}
+        ${num('trail_start_r', 'Start trailing at (R) profit', '0 = off')}
+        ${num('trail_distance_r', 'Trail distance (R)', 'How far the stop follows behind the best price')}
+        ${sel('runner_tp', 'Last TP leg (runner)', [['last', 'Furthest TP within the limit below'], ['none', 'No TP — the trailing stop exits'], ['normal', 'Next TP in order']], r.runner_tp)}
+        ${num('runner_max_r', 'Runner TP no further than (R)', 'Ignores placeholder TPs like 4900')}
+        ${num('min_tp_distance_r', 'Skip TPs closer than (R)', 'A TP a few ticks from the fill is noise; its leg rides to the next TP')}
+        ${num('pending_expiry_min', 'Cancel unfilled limits after (min)', '0 = keep until cancelled')}
+        ${sel('cancel_pending_at_tp1', 'Cancel unfilled limits once TP1 is reached', yn, r.cancel_pending_at_tp1, 'Don’t buy the pullback after the move already happened')}
+        ${sel('cancel_pending_on_new_signal', 'Cancel unfilled limits on a newer signal', yn, r.cancel_pending_on_new_signal, 'Same channel, same symbol')}
+        ${num('max_signals_per_symbol', 'Max open signals per symbol', '0 = no limit')}
       </div></section>
     <section class="card"><div class="card-h"><h2>Signals & timing</h2></div>
       <div class="card-b form-grid">
@@ -1026,7 +1041,8 @@ function renderSettings(main) {
   $('#setForm').addEventListener('submit', async e => {
     e.preventDefault();
     const f = collectForm(e.target);
-    const bools = ['flatten_on_stop', 'require_sl', 'split_tps', 'breakeven_after_tp1'];
+    const bools = ['flatten_on_stop', 'require_sl', 'split_tps', 'breakeven_after_tp1', 'trail_tp_ladder',
+      'cancel_pending_at_tp1', 'cancel_pending_on_new_signal'];
     const risk = {};
     for (const k of Object.keys(S.settings.risk)) if (k in f) risk[k] = bools.includes(k) ? f[k] === 'true' : f[k];
     await api('/api/settings', { body: {

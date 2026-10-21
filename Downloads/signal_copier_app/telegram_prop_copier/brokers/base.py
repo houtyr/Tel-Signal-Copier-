@@ -84,3 +84,7 @@ class Broker(ABC):
     @abstractmethod
     def is_pending(self, ref: int) -> bool:
         """True if `ref` is a pending (unfilled) limit/stop order."""
+
+    def leg_states(self, refs: list[int]) -> dict:
+        """For each order id: "pending", the live position ticket, or None (closed / cancelled)."""
+        return {r: "pending" if self.is_pending(r) else self.resolve(r) for r in refs}

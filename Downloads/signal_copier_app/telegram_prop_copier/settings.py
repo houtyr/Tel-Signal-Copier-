@@ -30,6 +30,11 @@ DEFAULTS = {
         "use_final_tp_only": False, "breakeven_after_tp1": True, "breakeven_offset": 0.0,
         "max_entry_slip_of_sl": 0.3, "if_price_moved": "limit",
         "zone_entry": "layers", "tp_hit_action": "breakeven", "add_on_entries": "half",
+        # Trade management - distances are multiples of R (the entry-to-SL distance), so they suit every symbol
+        "be_trigger_r": 0.3, "be_lock_r": 0.05, "trail_tp_ladder": True, "trail_start_r": 1.0, "trail_distance_r": 0.5,
+        "min_tp_distance_r": 0.1, "runner_tp": "last", "runner_max_r": 3.0,
+        "pending_expiry_min": 90, "cancel_pending_at_tp1": True, "cancel_pending_on_new_signal": True,
+        "max_signals_per_symbol": 2,
         "daily_stop_pct": 4.0, "daily_basis": "initial", "total_stop_pct": 9.0, "flatten_on_stop": True,
         "max_open_positions": 6, "max_signals_per_day": 8, "stop_at_profit_target_pct": None,
         "allowed_symbols": [], "blocked_symbols": [],

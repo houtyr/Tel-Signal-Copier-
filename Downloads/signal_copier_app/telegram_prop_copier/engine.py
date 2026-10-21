@@ -25,6 +25,7 @@ from mirror import MirrorMixin
 
 ROOT = Path(__file__).parent
 log = logging.getLogger("engine")
+MANAGE_SEC = 5          # how often open signals are checked for breakeven / trailing / stale limits
 current_msg: contextvars.ContextVar[int | None] = contextvars.ContextVar("current_msg", default=None)
 current_notes: contextvars.ContextVar[list | None] = contextvars.ContextVar("current_notes", default=None)
 
@@ -92,6 +93,9 @@ class Account:
         self.last_equity_write = 0.0
         self.paused_until = 0.0          # broker asked us to slow down (HTTP 429) - skip polls until then
         self.last_rate_note = 0.0
+        self.last_manage = 0.0
+        self.last_manage_note = 0.0
+        self.digits: dict[str, int] = {}   # broker symbol -> price digits, for rounding stop levels
 
     @property
     def cfg(self) -> dict:
@@ -162,8 +166,15 @@ class Engine(MirrorMixin):
                                  if not (v.get("closed") and v["ts"] < cutoff)}
         self.state["links"] = {k: v for k, v in self.state.get("links", {}).items() if v in self.state["signals"]}
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1))
-        tmp.replace(self.state_path)
+        for attempt in range(5):     # OneDrive / antivirus can hold the file for a moment ("Access is denied")
+            try:
+                tmp.write_text(json.dumps(self.state, indent=1))
+                tmp.replace(self.state_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
 
     # ---------- notes (log lines tied to the message being processed) ----------
     def note(self, level: str, account: str | None, text: str):
@@ -297,11 +308,15 @@ class Engine(MirrorMixin):
             await asyncio.sleep(float(self.settings.get("poll_sec", 3)))
             await asyncio.gather(*(self._poll(a) for a in list(self.accounts.values())), return_exceptions=True)
 
+    @staticmethod
+    def is_rate_limit(err: Exception) -> bool:
+        s = str(err)
+        return "429" in s or "Too Many Requests" in s or "rate limit" in s.lower()
+
     def rate_limit_pause(self, acc: Account, err: Exception) -> bool:
         """A 429 from the broker isn't a lost connection - reconnecting would log in again and send even
         more requests. Pause this account's polling for a while instead. Returns False for other errors."""
-        s = str(err)
-        if "429" not in s and "Too Many Requests" not in s and "rate limit" not in s.lower():
+        if not self.is_rate_limit(err):
             return False
         acc.paused_until = time.time() + 15
         if time.time() - acc.last_rate_note > 60:
@@ -329,7 +344,14 @@ class Engine(MirrorMixin):
                 self.store.add_equity(acc.name, acc.info.balance, acc.info.equity)
                 acc.last_equity_write = time.time()
             await self._enforce_limits(acc, start)
-            await self._breakeven_runners(acc)
+            try:
+                await self._manage_signals(acc)
+            except Exception as e:
+                if self.is_rate_limit(e):
+                    raise
+                if time.time() - acc.last_manage_note > 300:     # a management hiccup isn't a lost connection
+                    acc.last_manage_note = time.time()
+                    self.note("warn", acc.name, f"trade management check failed: {str(e)[:200]}")
         except Exception as e:
             if not self.rate_limit_pause(acc, e):
                 acc.status, acc.error, acc.retry_at = "error", str(e)[:300], time.time() + 15
@@ -346,30 +368,155 @@ class Engine(MirrorMixin):
                     await acc.call("close", p.ticket)
                 self.note("warn", acc.name, "closed all copier positions")
 
-    async def _breakeven_runners(self, acc: Account):
-        if not acc.cfg.get("breakeven_after_tp1", True):
+    # ---------- trade management: stale pending orders, breakeven, trailing ----------
+    # Per account, rec["st"][account][order ref] = {"s": pending|open|closed, "t": ticket, "sl": stop we last set,
+    # "R": entry-to-SL distance, "best"/"worst": furthest the price went for/against the position (price units)}.
+    async def _manage_signals(self, acc: Account):
+        if time.time() - acc.last_manage < MANAGE_SEC:
             return
-        for key, rec in self.state["signals"].items():
-            refs = rec["legs"].get(acc.name, [])
-            if rec.get("closed") or len(refs) < 2 or rec["be_done"].get(acc.name):
+        acc.last_manage = time.time()
+        c, dry, now, changed = acc.cfg, self.settings["dry_run"], time.time(), False
+        prices: dict[tuple, float] = {}
+        pos = {p.ticket: p for p in acc.positions}
+        for key, rec in list(self.state["signals"].items()):
+            refs = rec["legs"].get(acc.name)
+            if rec.get("closed") or not refs or rec.setdefault("done", {}).get(acc.name):
                 continue
-            if await acc.call("is_pending", refs[0]) or await acc.call("resolve", refs[0]) is not None:
+            legs = rec.setdefault("st", {}).setdefault(acc.name, {})
+            todo = [r for r in refs if legs.get(str(r), {}).get("s") != "closed"]
+            states = await acc.call("leg_states", todo) if todo else {}
+            for r in todo:
+                L, s = legs.setdefault(str(r), {"s": "pending", "miss": 0}), states.get(r)
+                if s == "pending":
+                    L["s"] = "pending"
+                elif s:
+                    if L["s"] != "open":
+                        changed = True
+                    L.update(s="open", t=s, miss=0)
+                else:
+                    # gone: filled and closed, or cancelled. Order history can lag a fresh fill, so confirm twice.
+                    L["miss"] = L.get("miss", 0) + 1
+                    if L["miss"] >= 2 and now - rec["ts"] > 30:
+                        L["s"], changed = "closed", True
+            pending = [r for r in refs if legs[str(r)]["s"] == "pending"]
+            live = [(r, legs[str(r)]) for r in refs if legs[str(r)]["s"] == "open"]
+            if not pending and not live:
+                if all(legs[str(r)]["s"] == "closed" for r in refs):
+                    rec["done"][acc.name] = True
+                    self._note_finished(acc, rec, legs)
+                    if all(rec["done"].get(n) for n in rec["legs"]):
+                        rec["closed"] = True
+                    changed = True
                 continue
-            rest = [t for t in [await acc.call("resolve", r) for r in refs[1:]] if t]
-            if not rest:
-                rec["be_done"][acc.name] = True
-                continue
-            pos = {p.ticket: p for p in acc.positions}
-            moved = 0
-            for t in rest:
-                p = pos.get(t)
-                if p and p.profit > 0:
-                    await acc.call("modify", t, sl=p.open_price)
-                    moved += 1
-            if moved:
-                self.note("info", acc.name, f"TP1 filled on {rec['symbol']} - {moved} runner(s) moved to breakeven")
-            rec["be_done"][acc.name] = True
+
+            buy = rec["side"] == "buy"
+            d = 1 if buy else -1
+            sym = acc.broker_symbol(rec["symbol"])
+            if (sym, buy) not in prices:            # the price a position would close at (bid for buys)
+                prices[(sym, buy)] = await acc.call("price", sym, "sell" if buy else "buy")
+            px = prices[(sym, buy)]
+            tps = sorted((t for t in rec.get("tps") or [] if t), key=lambda t: t * d)
+
+            if pending:
+                gate = rec.setdefault("gate", {})
+                if acc.name not in gate:     # first TP still ahead of the market when the signal came in
+                    gate[acc.name] = next((t for t in tps if (t - px) * d > 0), None)
+                why = None
+                exp = float(c.get("pending_expiry_min") or 0)
+                if exp and now - rec["ts"] >= exp * 60:
+                    why = f"not filled within {exp:g} min"
+                elif c.get("cancel_pending_at_tp1", True) and gate[acc.name] is not None \
+                        and (px - gate[acc.name]) * d >= 0:
+                    why = f"price already reached {gate[acc.name]:g} - the move happened without us, not chasing it"
+                if why:
+                    await self._cancel_refs(acc, rec, pending, why)
+                    changed = True
+
+            changed |= await self._protect(acc, key, rec, live, pos, px, tps, d)
+        if changed:
             self.save_state()
+
+    async def _protect(self, acc: Account, key: str, rec: dict, live: list, pos: dict, px: float,
+                       tps: list[float], d: int) -> bool:
+        """Breakeven, then lock profit TP by TP, then trail - all measured from each position's own fill."""
+        c, changed = acc.cfg, False
+        be_on = c.get("breakeven_after_tp1", True)
+        be_at, lock = float(c.get("be_trigger_r") or 0), float(c.get("be_lock_r") or 0)
+        tr_start, tr_dist = float(c.get("trail_start_r") or 0), float(c.get("trail_distance_r") or 0)
+        for r, L in live:
+            p = pos.get(L["t"])
+            if not p or rec.get("sl") is None:
+                continue
+            e = p.open_price
+            R = L.setdefault("R", abs(e - rec["sl"]))
+            L.setdefault("sl", rec["sl"])
+            if R <= 0:
+                continue
+            prog = (px - e) * d
+            L["best"], L["worst"] = max(L.get("best", prog), prog), min(L.get("worst", prog), prog)
+            best_px = e + d * L["best"]
+            want, why = None, ""
+
+            def tighter(level, label):
+                nonlocal want, why
+                if want is None or (level - want) * d > 0:
+                    want, why = level, label
+
+            if be_on and L["best"] >= be_at * R:
+                tighter(e + d * lock * R, "breakeven" + (f" +{lock:g}R" if lock else ""))
+            if c.get("trail_tp_ladder", True):
+                reached = [t for t in tps if (best_px - t) * d >= 0]
+                if len(reached) >= 2 and (reached[-2] - e) * d > lock * R:
+                    tighter(reached[-2], f"locked at {reached[-2]:g} (price reached {reached[-1]:g})")
+            if tr_start and tr_dist and L["best"] >= tr_start * R:
+                tighter(best_px - d * tr_dist * R, f"trailing {tr_dist:g}R behind the best price")
+            if want is None or (want - L["sl"]) * d <= 0.02 * R:      # nothing new, or too small to bother
+                continue
+            if (px - want) * d <= 0.02 * R:
+                continue          # price has pulled back past the level - a stop there would be rejected; retry later
+            want = await self._round_px(acc, p.symbol, want)
+            if not self.settings["dry_run"]:
+                await acc.call("modify", p.ticket, sl=want)
+            L["sl"], changed = want, True
+            if why.startswith("breakeven"):
+                rec.setdefault("be_done", {})[acc.name] = True
+            self.store.add_trade(acc.name, key, "auto_sl", rec["symbol"], rec["side"], p.volume, p.ticket, f"SL {want:g} - {why}")
+            self.note("info", acc.name, f"{'DRY RUN - would move' if self.settings['dry_run'] else 'moved'} "
+                                        f"SL of #{p.ticket} ({rec['symbol']}) to {want:g} - {why}")
+        return changed
+
+    @staticmethod
+    async def _round_px(a: Account, sym: str, x: float) -> float:
+        if sym not in a.digits:
+            a.digits[sym] = (await a.call("spec", sym)).digits
+        return round(x, a.digits[sym])
+
+    async def _cancel_refs(self, a: Account, rec: dict, refs: list[int], why: str) -> int:
+        legs = rec.setdefault("st", {}).setdefault(a.name, {})
+        for r in refs:
+            if not self.settings["dry_run"]:
+                await a.call("cancel_pending", r)
+            legs.setdefault(str(r), {})["s"] = "closed"
+        if refs:
+            self.note("info", a.name, f"cancelled {len(refs)} unfilled order(s) of the {rec['side'].upper()} "
+                                      f"{rec['symbol']} signal - {why}")
+        return len(refs)
+
+    async def _cancel_pending(self, a: Account, rec: dict, why: str) -> int:
+        """Cancel whatever of this signal is still an unfilled limit on account `a`."""
+        legs = rec.setdefault("st", {}).setdefault(a.name, {})
+        refs = [r for r in rec["legs"].get(a.name, []) if legs.get(str(r), {}).get("s") != "closed"]
+        states = await a.call("leg_states", refs) if refs else {}
+        return await self._cancel_refs(a, rec, [r for r in refs if states.get(r) == "pending"], why)
+
+    def _note_finished(self, acc: Account, rec: dict, legs: dict):
+        filled = [L for L in legs.values() if L.get("R")]
+        if not filled:
+            return
+        best = max(L.get("best", 0) / L["R"] for L in filled)
+        worst = min(L.get("worst", 0) / L["R"] for L in filled)
+        self.note("info", acc.name, f"{rec['side'].upper()} {rec['symbol']} signal finished - price went up to "
+                                    f"{best:+.2f}R in favour and {worst:+.2f}R against (R = entry-to-SL distance)")
 
     # ---------- incoming messages ----------
     def _reply_key(self, chat_id: int, reply_to: int | None) -> str | None:
@@ -649,6 +796,22 @@ class Engine(MirrorMixin):
             self.note("warn", a.name, f"skipped - {sig.order_type} order without entry price"); return [], []
         sym = a.broker_symbol(sig.symbol)
 
+        if not label:
+            # A fresh signal on the same symbol replaces the channel's older idea: drop its unfilled limits
+            chat = key.split(":")[0]
+            older = [(k, s) for k, s in self.state["signals"].items() if k != key and s["symbol"] == sig.symbol
+                     and not s.get("closed") and a.name in s["legs"] and not s.get("done", {}).get(a.name)]
+            if r.get("cancel_pending_on_new_signal", True):
+                for k, s in older:
+                    if k.split(":")[0] == chat:
+                        await self._cancel_pending(a, s, "a newer signal on the same symbol arrived")
+            limit = int(r.get("max_signals_per_symbol") or 0)
+            active = [k for k, s in older if not s.get("st", {}).get(a.name)
+                      or any(L.get("s") != "closed" for L in s["st"][a.name].values())]
+            if limit and len(active) >= limit:
+                self.note("warn", a.name, f"skipped - already {len(active)} open {sig.symbol} signal(s) "
+                                          f"(max {limit} per symbol)"); return [], []
+
         info = await a.call("account")
         start_eq = await self.day_start_equity(a)
         open_pos = await a.call("positions")
@@ -693,25 +856,40 @@ class Engine(MirrorMixin):
         buy = sig.side == "buy"
         tps_all = [t for t in sig.tps if (t > (sl or 0)) == buy]
 
-        def layer_tps(entry_px: float) -> list[float]:
+        def layer_tps(entry_px: float) -> tuple[list, list[str]]:
+            """TP per leg for an entry at entry_px (None = runner without TP), plus notes on dropped TPs."""
             # A TP the price has already passed would be rejected or close instantly - drop it,
             # its share of the volume goes to the remaining TPs
             ok = [t for t in tps_all if (t > entry_px) == buy]
+            why = []
+            if len(ok) < len(tps_all):
+                why.append(f"TP {', '.join(f'{t:g}' for t in tps_all if t not in ok)} already past the entry {entry_px:.5g}")
+            R = abs(entry_px - sl) if sl is not None else 0
+            near = [t for t in ok if abs(t - entry_px) < float(r.get("min_tp_distance_r") or 0) * R]
+            if near and len(near) < len(ok):    # a TP a few ticks away is noise - its leg rides to the next TP
+                ok = [t for t in ok if t not in near]
+                why.append(f"TP {', '.join(f'{t:g}' for t in near)} too close to the entry {entry_px:.5g}")
             if r.get("use_final_tp_only") and ok:
-                return [ok[-1]]
-            return ok[: int(r.get("max_tps", 3))] if r.get("split_tps", True) else ok[-1:]
+                return [ok[-1]], why
+            if not r.get("split_tps", True):
+                return ok[-1:], why
+            n, mode = int(r.get("max_tps", 3)), r.get("runner_tp", "last")
+            if n < 2 or not ok or mode not in ("last", "none") or (mode == "last" and len(ok) <= n):
+                return ok[:n], why
+            if mode == "none":                  # last leg has no TP - the trailing stop decides when it exits
+                return ok[:n - 1] + [None], why
+            far = [t for t in ok[n - 1:] if not R or abs(t - entry_px) <= float(r.get("runner_max_r") or 3) * R]
+            return ok[:n - 1] + [far[-1] if far else ok[n - 1]], why
 
         refs, layers_out, placed, leg_counts = [], [], [], []
         for layer, otype, price in plan:
             entry_px = mkt if otype == "market" else price
-            tps = layer_tps(entry_px)
+            tps, why = layer_tps(entry_px)
             if tps_all and not tps:
                 self.note("warn", a.name, f"layer {layer + 1}: every TP is already past the entry {entry_px:.5g} - not placed")
                 continue
-            if len(tps) < min(len(tps_all), int(r.get("max_tps", 3))) and r.get("split_tps", True) \
-                    and not r.get("use_final_tp_only"):
-                gone = [f"{t:g}" for t in tps_all if (t > entry_px) != buy]
-                self.note("info", a.name, f"layer {layer + 1}: TP {', '.join(gone)} already past the entry {entry_px:.5g} - skipped")
+            if why and r.get("split_tps", True) and not r.get("use_final_tp_only"):
+                self.note("info", a.name, f"layer {layer + 1}: {'; '.join(why)} - skipped")
             leg_counts.append(len(tps) or 1)
             vols = split_volume(floor_step(per_layer, spec.volume_step), max(1, len(tps)), spec)
             legs_tp = tps[: len(vols)] + [None] * (len(vols) - len(tps[: len(vols)]))
@@ -743,10 +921,18 @@ class Engine(MirrorMixin):
             a = self.accounts.get(name)
             if not a or a.status != "connected" or not refs:
                 continue
-            try:
-                await self.apply_on_account(a, key, rec, refs, cmd)
-            except Exception as e:
-                self.note("error", name, f"{cmd.action} failed: {e}")
+            for attempt in (1, 2):
+                try:
+                    await self.apply_on_account(a, key, rec, refs, cmd)
+                except Exception as e:
+                    # A 429 means the request was refused, not executed - wait out the broker's pause and redo it.
+                    # Not for partial closes: repeating one after a half-done first try would close too much.
+                    if attempt == 1 and self.is_rate_limit(e) and cmd.action != "close_partial":
+                        self.note("warn", name, f"broker is rate-limiting - retrying {cmd.action.replace('_', ' ')} in 12s")
+                        await asyncio.sleep(12)
+                        continue
+                    self.note("error", name, f"{cmd.action} failed: {e}")
+                break
         self.save_state()
 
     @staticmethod
@@ -762,6 +948,8 @@ class Engine(MirrorMixin):
         if cmd.action == "tp_hit":
             mode = a.cfg.get("tp_hit_action", "breakeven")
             n = int(cmd.value or 1)
+            if a.cfg.get("cancel_pending_at_tp1", True):
+                await self._cancel_pending(a, rec, f"the channel says TP{n} hit - not chasing the move")
             if mode == "none" or (mode == "breakeven" and not a.cfg.get("breakeven_after_tp1", True)):
                 self.note("info", a.name, f"TP{n} hit - no action (setting)"); return
             if mode == "trail" and n >= 2 and len(rec.get("tps") or []) >= n - 1:
@@ -790,11 +978,12 @@ class Engine(MirrorMixin):
                 self.note("info", a.name, f"signal has no {cmd.ref.replace('_', ' ')} - using each position's own entry")
 
         layer_of = dict(zip(refs, rec.get("leg_layer", {}).get(a.name) or [0] * len(refs)))
-        live = {}
+        live, ref_of = {}, {}
         for r in refs:
             t = await a.call("resolve", r)
             if t:
-                live[t] = layer_of.get(r, 0)
+                live[t], ref_of[t] = layer_of.get(r, 0), r
+        tracked = rec.setdefault("st", {}).setdefault(a.name, {})     # stops the copier set (TradeLocker doesn't report them)
         if cmd.action == "close_all" and not dry:
             for r in refs:                       # also remove deeper-layer limits that never filled
                 if await a.call("is_pending", r):
@@ -831,22 +1020,28 @@ class Engine(MirrorMixin):
                 await a.call("close", t, p.volume * (cmd.value or 0.5))
             elif cmd.action in ("breakeven", "move_sl") and p:
                 if cmd.action == "breakeven" and sl_target is None:
-                    off = float(a.cfg.get("breakeven_offset", 0))
+                    # a hair into profit, so spread + commission don't turn "breakeven" into a small loss
+                    R = abs(p.open_price - rec["sl"]) if rec.get("sl") is not None else 0
+                    off = float(a.cfg.get("breakeven_offset", 0)) + float(a.cfg.get("be_lock_r") or 0) * R
                     new_sl = p.open_price + off if p.side == "buy" else p.open_price - off
                 else:
                     new_sl = sl_target
+                new_sl = await self._round_px(a, p.symbol, new_sl)
+                L = tracked.setdefault(str(ref_of[t]), {"s": "open", "t": t})
+                cur_sl = p.sl or L.get("sl") or rec.get("sl")
                 exit_px = await a.call("price", p.symbol, "sell" if p.side == "buy" else "buy")
                 # A stop on the wrong side of the market would be rejected (or fill instantly) - don't send it
                 if (p.side == "buy" and new_sl >= exit_px) or (p.side == "sell" and new_sl <= exit_px):
                     self.note("warn", a.name, f"#{t}: SL {new_sl:.5g} would be past the current price {exit_px:.5g} - left unchanged")
                     skipped += 1
                     continue
-                # Never loosen a stop that is already tighter
-                if p.sl and ((p.side == "buy" and new_sl < p.sl) or (p.side == "sell" and new_sl > p.sl)) \
-                        and cmd.action == "breakeven":
+                # Never loosen a stop that is already tighter (an explicit "SL to <price>" from the channel still applies)
+                if cur_sl and ((p.side == "buy" and new_sl <= cur_sl) or (p.side == "sell" and new_sl >= cur_sl)) \
+                        and (cmd.action == "breakeven" or cmd.ref):
                     skipped += 1
                     continue
                 await a.call("modify", t, sl=new_sl)
+                L["sl"] = new_sl
                 if cmd.action == "breakeven":
                     rec["be_done"][a.name] = True
             elif cmd.action == "move_tp":

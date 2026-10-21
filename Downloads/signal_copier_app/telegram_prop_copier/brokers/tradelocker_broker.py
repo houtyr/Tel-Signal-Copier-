@@ -85,7 +85,7 @@ class TradeLockerBroker(Broker):
                     raise self._rate_limited() from None
                 log.warning("[%s] TradeLocker rate limit on an order request - retrying in %ss", self.name, wait)
                 time.sleep(wait)
-        self._cache = {k: (0.0, v) for k, v in self._cache.items()}   # expire reads, keep them as fallback
+        self._cache = {k: (0.0, v) for k, (_, v) in self._cache.items()}   # expire reads, keep them as fallback
         return out
 
     def _orders(self, history: bool = False, force: bool = False):
@@ -246,6 +246,26 @@ class TradeLockerBroker(Broker):
                 return None  # opened but already closed
             time.sleep(0.5)
         return None
+
+    def leg_states(self, refs: list[int]) -> dict:
+        """Batched is_pending/resolve: one read each of pending orders, order history and positions."""
+        pend = self._orders()
+        pend_ids = set(pend["id"].astype(int)) if pend is not None and not pend.empty else set()
+        out = {r: "pending" for r in refs if int(r) in pend_ids}
+        todo = [r for r in refs if r not in out]
+        if todo:
+            hist = self._orders(history=True)
+            df = self._positions_df()
+            open_ids = set(df["id"].astype(int)) if df is not None and not df.empty else set()
+            pid_of = {}
+            if hist is not None and not hist.empty:
+                for oid, pid in zip(hist["id"].astype(int), hist["positionId"]):
+                    if pid == pid and pid:  # not NaN / 0
+                        pid_of[int(oid)] = int(pid)
+            for r in todo:
+                pid = pid_of.get(int(r))
+                out[r] = pid if pid in open_ids else None
+        return out
 
     def modify(self, ticket, sl=None, tp=None) -> bool:
         params = {}
