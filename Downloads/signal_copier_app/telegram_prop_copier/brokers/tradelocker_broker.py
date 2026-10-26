@@ -95,9 +95,21 @@ class TradeLockerBroker(Broker):
         if TLAPI is None:
             raise RuntimeError("tradelocker package not installed: pip install tradelocker")
         env = self.cfg.get("environment", "https://demo.tradelocker.com")
-        kw = {"acc_num": int(self.cfg["acc_num"])} if self.cfg.get("acc_num") else {}
-        self.tl = TLAPI(environment=env, username=self.cfg["email"], password=self.cfg["password"],
-                        server=self.cfg["server"], log_level="warning", **kw)
+        login = dict(environment=env, username=self.cfg["email"], password=self.cfg["password"],
+                     server=self.cfg["server"], log_level="warning")
+        num = int(self.cfg["acc_num"]) if self.cfg.get("acc_num") else 0
+        try:
+            self.tl = TLAPI(**login, **({"acc_num": num} if num else {}))
+        except ValueError as e:
+            # People usually paste the account ID shown in the TradeLocker terminal (e.g. 2574741), not the
+            # short acc_num (e.g. 1) - accept either
+            if not num or "not found in all_accounts" not in str(e):
+                raise
+            try:
+                self.tl = TLAPI(**login, account_id=num)
+            except ValueError:
+                raise RuntimeError(f"[{self.name}] account {num} isn't on this TradeLocker login - use the "
+                                   f"account ID or acc number from this list:\n{e}") from None
         try:
             accts = self.tl.get_all_accounts()
             row = accts[accts["id"] == self.tl.account_id]
